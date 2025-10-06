@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sqlalchemy
+pandas
+numpy
+torch
+torchvision
+torchaudio
+python-docx
+pdfplumber
+pytesseract
+pillow
+sentence_transformers
+sentencepiece
