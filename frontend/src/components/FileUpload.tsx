@@ -15,8 +15,8 @@ export default function FileUpload({ onUploaded }: FileUploadProps) {
     if (!files.length) return alert("Select files first");
     setLoading(true);
     try {
-      await uploadFiles(files);
-      await processFiles();
+      const fileMetadata = await uploadFiles(files);
+      await processFiles(fileMetadata);
       setFiles([]);
       if (inputRef.current) inputRef.current.value = "";
       onUploaded();

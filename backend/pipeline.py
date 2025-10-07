@@ -13,17 +13,23 @@ import os
 import re
 import json
 import logging
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, Any, List
 import pdfplumber
 from docx import Document
+import io
+import datetime
 from PIL import Image
 import pytesseract
 from sentence_transformers import SentenceTransformer, util
+import tempfile
 
 from db import SessionLocal, engine, Base
 from models import MasterSpec, RawExtraction
 import pandas as pd
+from s3_utils import download_prefix, upload_folder, download_file_stream, list_objects, upload_file
 
 # ensure DB tables
 Base.metadata.create_all(bind=engine)
@@ -58,9 +64,14 @@ CANONICAL = {
 }
 
 logger.info("Loading embedding model...")
-EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-PARAM_EMBEDS = {k: EMBED_MODEL.encode(v, convert_to_tensor=True) for k, v in CANONICAL.items()}
-logger.info("Model loaded.")
+try:
+    EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    PARAM_EMBEDS = {k: EMBED_MODEL.encode(v, convert_to_tensor=True) for k, v in CANONICAL.items()}
+    logger.info(f"Model loaded successfully. Canonical params: {list(CANONICAL.keys())}")
+except Exception as e:
+    logger.error(f"Failed to load embedding model: {e}")
+    EMBED_MODEL = None
+    PARAM_EMBEDS = {}
 
 
 def extract_from_pdf(path: Path) -> str:
@@ -104,17 +115,106 @@ def extract_text_for_file(file_path: Path):
     else:
         return file_path.read_text(encoding="utf-8", errors="ignore")
 
+def extract_text_for_s3_stream(file_stream, filename: str):
+    """Extract text from S3 file stream based on file extension."""
+    suf = Path(filename).suffix.lower()
+    
+    # For PDF and DOCX files, we need to save to temporary file since the libraries require file paths
+    if suf in (".pdf", ".docx"):
+        temp_file_path = None
+        try:
+            # Create temporary file
+            suffix = ".pdf" if suf == ".pdf" else ".docx"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                # Read the file stream content
+                file_content = file_stream.read()
+                temp_file.write(file_content)
+                temp_file.flush()
+                temp_file_path = temp_file.name
+            
+            # Close the temp file handle before processing
+            # This is important on Windows to avoid file locking issues
+            
+            # Extract text from the file
+            if suf == ".pdf":
+                text = extract_from_pdf(Path(temp_file_path))
+            else:  # .docx
+                text = extract_from_docx(Path(temp_file_path))
+            
+            # Clean up temp file with retry logic for Windows
+            _safe_delete_file(temp_file_path)
+            return text
+            
+        except Exception as e:
+            logger.error(f"Error processing {suf.upper()} file {filename}: {e}")
+            if temp_file_path:
+                _safe_delete_file(temp_file_path)
+            return ""
+            
+    elif suf in (".png", ".jpg", ".jpeg", ".tiff"):
+        try:
+            image = Image.open(io.BytesIO(file_stream.read()))
+            txt = pytesseract.image_to_string(image)
+            return txt.strip()
+        except Exception as e:
+            logger.error(f"Error processing image file {filename}: {e}")
+            return ""
+    else:
+        # For text files, read directly from stream
+        try:
+            return file_stream.read().decode('utf-8', errors='ignore')
+        except Exception as e:
+            logger.error(f"Error processing text file {filename}: {e}")
+            return ""
+
+
+def _safe_delete_file(file_path: str, max_retries: int = 3, delay: float = 0.1):
+    """Safely delete a file with retry logic for Windows file locking issues."""
+    if not file_path or not os.path.exists(file_path):
+        return
+    
+    for attempt in range(max_retries):
+        try:
+            os.unlink(file_path)
+            logger.debug(f"Successfully deleted temp file: {file_path}")
+            return
+        except (OSError, PermissionError) as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Failed to delete temp file {file_path} (attempt {attempt + 1}): {e}. Retrying...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to delete temp file {file_path} after {max_retries} attempts: {e}")
+                # On Windows, we might need to schedule the file for deletion on next reboot
+                try:
+                    import ctypes
+                    if os.name == 'nt':  # Windows
+                        ctypes.windll.kernel32.MoveFileExW(
+                            file_path, None, 
+                            ctypes.c_int(4)  # MOVEFILE_DELAY_UNTIL_REBOOT
+                        )
+                        logger.info(f"Scheduled temp file for deletion on reboot: {file_path}")
+                except Exception:
+                    pass
+
 
 def map_line_to_param(line: str):
-    emb = EMBED_MODEL.encode(line, convert_to_tensor=True)
-    best_param = None
-    best_score = -1.0
-    for param, embeds in PARAM_EMBEDS.items():
-        score = util.cos_sim(emb, embeds).max().item()
-        if score > best_score:
-            best_param = param
-            best_score = score
-    return best_param, best_score
+    if EMBED_MODEL is None or not PARAM_EMBEDS:
+        logger.error("Embedding model not loaded. Cannot map line to param.")
+        return None, 0.0
+    
+    try:
+        emb = EMBED_MODEL.encode(line, convert_to_tensor=True)
+        best_param = None
+        best_score = -1.0
+        for param, embeds in PARAM_EMBEDS.items():
+            score = util.cos_sim(emb, embeds).max().item()
+            if score > best_score:
+                best_param = param
+                best_score = score
+        return best_param, best_score
+    except Exception as e:
+        logger.error(f"Error in map_line_to_param: {e}")
+        return None, 0.0
 
 
 VALUE_UNIT_RE = re.compile(
@@ -180,11 +280,119 @@ def source_type_and_priority(filepath: Path):
     return "Other", 4
 
 
+def process_all_and_build_master_from_s3(run_id: str, priority=("DOCX", "PDF", "Image")):
+    """Process files directly from S3 without downloading to local storage."""
+    session = SessionLocal()
+    try:
+        parsed_by_source = {}
+        extraction_id_by_file = {}
+        
+        bucket = os.getenv("S3_BUCKET")
+        if not bucket:
+            raise RuntimeError("S3_BUCKET environment variable not set.")
+        
+        # Get all files from S3 for this run
+        prefix = f"uploads/{run_id}/"
+        s3_files = list(list_objects(bucket, prefix))
+        
+        if not s3_files:
+            raise RuntimeError(f"No files found in S3 for run_id: {run_id}")
+        
+        logger.info(f"Processing {len(s3_files)} files from S3 for run_id: {run_id}")
+        
+        # --- Extract from S3 files ---
+        for s3_key in s3_files:
+            if s3_key.endswith("/"):  # Skip folders
+                continue
+                
+            filename = s3_key.split("/")[-1]  # Get just the filename
+            stype, sprio = source_type_and_priority(Path(filename))
+            
+            try:
+                # Download file as stream from S3
+                file_stream = download_file_stream(bucket, s3_key)
+                raw_text = extract_text_for_s3_stream(file_stream, filename)
+                logger.info(f"Extracted {len(raw_text)} chars from {filename} (type={stype}) from S3")
+                
+                # Debug: Log first few lines of extracted text
+                if raw_text:
+                    lines = raw_text.splitlines()[:5]
+                    logger.info(f"First 5 lines from {filename}: {lines}")
+                else:
+                    logger.warning(f"No text extracted from {filename}")
+                
+                # Save raw extraction (DB)
+                re_obj = RawExtraction(source=filename, raw_text=raw_text, meta_info={"type": stype, "s3_key": s3_key})
+                session.add(re_obj)
+                session.commit()
+                extraction_id_by_file[filename] = re_obj.id
+                logger.info(f"Saved raw extraction to DB with ID: {re_obj.id}")
+                
+                # Parse lines
+                parsed = {}
+                lines_processed = 0
+                specs_found = 0
+                
+                for line in raw_text.splitlines():
+                    if not line.strip():
+                        continue
+                    lines_processed += 1
+                    
+                    param, score = map_line_to_param(line)
+                    if score < 0.55:
+                        continue
+                    
+                    logger.info(f"Found potential param '{param}' with score {score:.3f} in line: {line.strip()}")
+                    
+                    val, unit = extract_value_unit(line)
+                    if not val:
+                        tokens = line.strip().split()
+                        if len(tokens) >= 2:
+                            candidate = tokens[-1]
+                            val, unit = candidate, None
+                    
+                    if val:
+                        specs_found += 1
+                        # choose normalization target heuristically
+                        target = None
+                        if any(k in param for k in ("diameter", "hole", "cap", "thickness", "length", "width", "size")):
+                            target = "mm"
+                        elif "surface_finish" in param or "finish" in param:
+                            target = "um"
+                        elif "pressure" in param:
+                            target = "bar"
+                        elif "temperature" in param:
+                            target = "C"
+
+                        norm_val = normalize_numeric(val, unit, target) if target else val
+                        parsed.setdefault(param, []).append({
+                            "raw": line.strip(),
+                            "value": norm_val,
+                            "unit": unit or "",
+                            "source": stype,
+                            "priority": sprio,
+                            "filename": filename,
+                            "extraction_id": re_obj.id,
+                            "s3_key": s3_key
+                        })
+                        
+                        logger.info(f"Added spec: {param} = {norm_val} {unit or ''} (source: {stype})")
+                
+                logger.info(f"File {filename}: processed {lines_processed} lines, found {specs_found} specs")
+                parsed_by_source[filename] = parsed
+                
+            except Exception as e:
+                logger.error(f"Failed to process file {filename} from S3: {e}")
+                continue
+        
+        return _build_master_from_parsed_data(session, parsed_by_source, extraction_id_by_file)
+    finally:
+        session.close()
+
 def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
+    """Legacy function for processing local files - kept for backward compatibility."""
     session = SessionLocal()
     parsed_by_source = {}
-
-    # store raw extraction ids to pick latest when needed
     extraction_id_by_file = {}
 
     # --- Extract from files ---
@@ -243,7 +451,11 @@ def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
                 })
 
         parsed_by_source[filepath.name] = parsed
+    
+    return _build_master_from_parsed_data(session, parsed_by_source, extraction_id_by_file)
 
+def _build_master_from_parsed_data(session, parsed_by_source, extraction_id_by_file):
+    """Build master specifications from parsed data."""
     # --- Build in-memory master variants by param (list of variants) ---
     master_variants: Dict[str, List[Dict[str, Any]]] = {}
     for param in CANONICAL.keys():
@@ -260,7 +472,11 @@ def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
 
     # --- Persist all variants into MasterSpec table (one row per variant) ---
     # We'll insert a row if exact (param, source, raw) doesn't already exist; else update.
+    total_specs_to_save = 0
+    specs_saved = 0
+    
     for param, variants in master_variants.items():
+        total_specs_to_save += len(variants)
         for variant in variants:
             # check if a row exists with same param + source + raw (very likely unique)
             existing = session.query(MasterSpec).filter(
@@ -269,11 +485,16 @@ def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
                 MasterSpec.raw == variant.get("raw")
             ).first()
             meta = {"filename": variant.get("filename"), "extraction_id": variant.get("extraction_id")}
+            if variant.get("s3_key"):
+                meta["s3_key"] = variant.get("s3_key")
+            
             if existing:
                 existing.value = variant.get("value")
                 existing.unit = variant.get("unit")
                 existing.priority = int(variant.get("priority", 10))
                 existing.meta = meta
+                logger.info(f"Updated existing spec: {param} = {variant.get('value')}")
+                specs_saved += 1
             else:
                 new = MasterSpec(
                     param=param,
@@ -285,7 +506,12 @@ def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
                     meta=meta
                 )
                 session.add(new)
+                logger.info(f"Added new spec to session: {param} = {variant.get('value')}")
+                specs_saved += 1
+    
+    logger.info(f"Saving {specs_saved} specs to database (out of {total_specs_to_save} variants)")
     session.commit()
+    logger.info("Successfully committed specs to database")
 
     # --- Build merged master: for each param, choose a 'chosen' variant by priority & recency ---
     merged_master = {}
@@ -316,16 +542,28 @@ def process_all_and_build_master(priority=("DOCX", "PDF", "Image")):
             "variants": api_variants
         }
 
-    # --- Save CSV snapshot of the chosen values ---
+    # --- Save CSV snapshot directly to S3 instead of local storage ---
     df_rows = []
     for p, info in merged_master.items():
         chosen = info.get("chosen") or {}
         df_rows.append({"param": p, "value": chosen.get("value") or "", "unit": chosen.get("unit") or "", "source": chosen.get("source") or ""})
     df_out = pd.DataFrame(df_rows)
-    out_csv = OUTPUT_DIR / "master_specs.csv"
-    df_out.to_csv(out_csv, index=False)
+    
+    # Save to temporary file and upload to S3
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
+        df_out.to_csv(temp_file.name, index=False)
+        temp_file_path = temp_file.name
+    
+    # Upload to S3
+    bucket = os.getenv("S3_BUCKET")
+    if bucket:
+        s3_key = f"outputs/master_specs.csv"
+        upload_file(bucket, temp_file_path, s3_key)
+        logger.info(f"Master specs CSV uploaded to s3://{bucket}/{s3_key}")
+    
+    # Clean up temp file
+    os.unlink(temp_file_path)
 
-    session.close()
     return parsed_by_source, merged_master
 
 
@@ -382,7 +620,7 @@ def classify_defect_with_master(defect: dict, merged_master: dict):
 def run_defect_mapping(defect_file_path: Path, merged_master: Dict[str, Any]) -> pd.DataFrame:
     """
     Run defect mapping and return results as a DataFrame.
-    Saves defect_results.csv to data/outputs/.
+    Saves defect_results.csv to S3 instead of local storage.
     """
     # Load defects CSV or JSON
     if defect_file_path.suffix.lower() == ".csv":
@@ -394,9 +632,87 @@ def run_defect_mapping(defect_file_path: Path, merged_master: Dict[str, Any]) ->
     # Apply defect classification
     df["decision"] = df.apply(lambda r: classify_defect_with_master(r.to_dict(), merged_master), axis=1)
 
-    # Save results
-    out_path = Path("data/outputs/defect_results.csv")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_path, index=False)
+    # Save results to S3 instead of local storage
+    bucket = os.getenv("S3_BUCKET")
+    if bucket:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
+            df.to_csv(temp_file.name, index=False)
+            temp_file_path = temp_file.name
+        
+        s3_key = f"outputs/defect_results.csv"
+        upload_file(bucket, temp_file_path, s3_key)
+        logger.info(f"Defect results CSV uploaded to s3://{bucket}/{s3_key}")
+        
+        # Clean up temp file
+        os.unlink(temp_file_path)
+    else:
+        # Fallback to local storage if S3 not configured
+        out_path = Path("data/outputs/defect_results.csv")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path, index=False)
 
     return df
+
+
+def pull_uploads_from_s3(run_id: str = "latest"):
+    """
+    Downloads S3 prefix s3://{S3_BUCKET}/uploads/{run_id}/ into UPLOAD_DIR (clears UPLOAD_DIR first).
+    """
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET environment variable not set. Please configure S3_BUCKET in your environment.")
+
+    try:
+        logger.info(f"Pulling uploads from S3: s3://{bucket}/uploads/{run_id}/")
+        
+        # Optionally clear existing uploads to avoid duplicates
+        if UPLOAD_DIR.exists():
+            for f in UPLOAD_DIR.iterdir():
+                if f.is_file():
+                    f.unlink()
+                else:
+                    shutil.rmtree(f)
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+        prefix = f"uploads/{run_id}/"
+        download_prefix(bucket, prefix, str(UPLOAD_DIR))
+        
+        # Check if any files were downloaded
+        files_in_upload_dir = list(UPLOAD_DIR.iterdir())
+        if not files_in_upload_dir:
+            logger.warning(f"No files found in s3://{bucket}/uploads/{run_id}/")
+        else:
+            logger.info(f"Successfully pulled {len(files_in_upload_dir)} files from S3")
+            
+    except Exception as e:
+        logger.error(f"Failed to pull uploads from S3: {e}")
+        raise RuntimeError(f"S3 download failed: {e}")
+
+
+def push_outputs_to_s3(run_id: str = None):
+    """
+    Upload outputs folder to s3://{S3_BUCKET}/outputs/{run_id or timestamp}/
+    """
+    bucket = os.getenv("S3_BUCKET")
+    if not bucket:
+        raise RuntimeError("S3_BUCKET environment variable not set. Please configure S3_BUCKET in your environment.")
+    
+    try:
+        if run_id is None:
+            run_id = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        
+        logger.info(f"Pushing outputs to S3: s3://{bucket}/outputs/{run_id}/")
+        
+        # Check if OUTPUT_DIR has any files to upload
+        if not OUTPUT_DIR.exists() or not any(OUTPUT_DIR.iterdir()):
+            logger.warning(f"No output files found in {OUTPUT_DIR} to upload to S3")
+            return
+        
+        prefix = f"outputs/{run_id}"
+        upload_folder(bucket, str(OUTPUT_DIR), prefix)
+        
+        logger.info(f"Successfully pushed outputs to s3://{bucket}/outputs/{run_id}/")
+        
+    except Exception as e:
+        logger.error(f"Failed to push outputs to S3: {e}")
+        raise RuntimeError(f"S3 upload failed: {e}")

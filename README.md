@@ -121,3 +121,38 @@ This POC implements:
 - Normalization logic
 - Defect mapping engine
 - React UI with upload + editable table
+
+# Terraform: EC2 + RDS + S3 for Spec Extraction POC (dev)
+
+Prereqs:
+
+- Terraform v1.6+
+- AWS CLI configured with credentials
+- An existing EC2 key pair name in the target account/region
+
+1. Edit `terraform/variables.tf` to set `key_name` and `repo_git_url` (or supply via `-var`).
+2. Initialize Terraform:
+
+- terraform init
+
+3. Plan:
+
+- terraform plan -var "key_name=your-key" -var "db_password=YourStrongPass!"
+
+4. Apply:
+
+- terraform apply -var "key_name=your-key" -var "db_password=YourStrongPass!"
+
+5. After apply completes, note outputs:
+
+- `ec2_public_ip` → visit `http://<ip>/docs` for FastAPI Swagger (if your app exposes it)
+- `rds_endpoint` → database host
+- `s3_bucket` → bucket for uploads/outputs
+
+6. SSH (if needed):
+
+- ssh -i /path/to/your-key.pem ubuntu@<ec2_public_ip>
+
+7. Logs:
+
+- `/home/ubuntu/specs-pipeline/app.log`

@@ -13,3 +13,5 @@ pytesseract
 pillow
 sentence_transformers
 sentencepiece
+boto3
+python-dotenv

@@ -9,8 +9,12 @@ export async function uploadFiles(files: File[]) {
   return res.json();
 }
 
-export async function processFiles() {
-  const res = await fetch(`${BASE}/process/`, { method: "POST" });
+export async function processFiles(payload: any) {
+  const res = await fetch(`${BASE}/process/`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    headers: { "Content-Type": "application/json" },
+  });
   if (!res.ok) {
     const txt = await res.text();
     throw new Error("Process failed: " + txt);
