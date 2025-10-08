@@ -1,5 +1,5 @@
 // src/services/api.ts
-const BASE = import.meta.env.REACT_APP_API_BASE || "http://localhost:8001";
+const BASE = import.meta.env.VITE_REACT_APP_API_BASE || "http://localhost:8001";
 
 export async function uploadFiles(files: File[]) {
   const form = new FormData();

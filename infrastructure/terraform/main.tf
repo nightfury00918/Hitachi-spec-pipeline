@@ -322,14 +322,21 @@ resource "aws_instance" "fastapi" {
   iam_instance_profile        = aws_iam_instance_profile.ec2_profile.name
   associate_public_ip_address = true
 
-  user_data = templatefile("${path.module}/ec2_user_data.tpl", {
+  # Add this block to increase disk space
+  root_block_device {
+    volume_size           = 30  # 30GB should be plenty
+    volume_type           = "gp3"
+    delete_on_termination = true
+  }
+
+  user_data_base64 = base64encode(templatefile("${path.module}/ec2_user_data.tpl", {
     repo_git_url = var.repo_git_url
     aws_region   = var.aws_region
     s3_bucket    = aws_s3_bucket.docs_bucket.bucket
     db_endpoint  = aws_db_instance.postgres.address
     db_user      = var.db_username
     db_password  = var.db_password
-  })
+  }))
 
   tags = merge(local.tags, { Name = "${local.name_prefix}-ec2" })
 }

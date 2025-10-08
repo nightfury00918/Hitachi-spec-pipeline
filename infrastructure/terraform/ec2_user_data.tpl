@@ -1,64 +1,70 @@
-#cloud-config
-package_update: true
-package_upgrade: true
-packages:
-  - git
-  - python3
-  - python3-venv
-  - python3-pip
-  - awscli
-  - postgresql-client
-  - tesseract-ocr
-  - libtesseract-dev
-  - python3-pil
+#!/bin/bash
+set -ex
+exec > /var/log/user-data.log 2>&1
 
-write_files:
-  - path: /etc/systemd/system/fastapi.service
-    permissions: "0644"
-    content: |
-      [Unit]
-      Description=FastAPI Service
-      After=network.target
+echo "=== Starting user-data script at $(date) ==="
 
-      [Service]
-      User=ubuntu
-      WorkingDirectory=/home/ubuntu/specs-pipeline/backend
-      ExecStart=/home/ubuntu/specs-pipeline/backend/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
-      EnvironmentFile=/home/ubuntu/specs-pipeline/backend/.env
-      Restart=always
-      RestartSec=5
+# Update and install packages
+apt-get update
+apt-get install -y git python3 python3-venv python3-pip awscli postgresql-client tesseract-ocr libtesseract-dev python3-pil
 
-      [Install]
-      WantedBy=multi-user.target
+# Setup application
+cd /home/ubuntu
 
-runcmd:
-  - |
-    set -e
-    cd /home/ubuntu
+# Clone or update repo
+if [ ! -d specs-pipeline ]; then
+  echo "Cloning repository..."
+  sudo -u ubuntu git clone ${repo_git_url} specs-pipeline
+else
+  echo "Updating repository..."
+  cd specs-pipeline
+  sudo -u ubuntu git pull
+  cd /home/ubuntu
+fi
 
-    if [ ! -d specs-pipeline ]; then
-      git clone ${repo_git_url} specs-pipeline
-    else
-      cd specs-pipeline && git pull
-    fi
+cd /home/ubuntu/specs-pipeline/backend
 
-    cd specs-pipeline/backend
-    python3 -m venv venv
-    source venv/bin/activate
-    pip install --upgrade pip
-    pip install -r requirements.txt
+# Create virtual environment
+echo "Setting up Python virtual environment..."
+sudo -u ubuntu python3 -m venv venv
+sudo -u ubuntu bash -c '. venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt'
 
-    mkdir -p data/uploads data/landing data/outputs
-    chown -R ubuntu:ubuntu data/
+# Create directories
+echo "Creating data directories..."
+sudo -u ubuntu mkdir -p data/uploads data/landing data/outputs
 
-    echo "=== Writing .env file safely ==="
-    printf '%s\n' \
-      'AWS_REGION="${aws_region}"' \
-      'S3_BUCKET="${s3_bucket}"' \
-      'DATABASE_URL="postgresql://${db_user}:${db_password}@${db_endpoint}:5432/postgres"' \
-      > .env
-    chown ubuntu:ubuntu .env
+# Create .env file
+echo "Creating .env file..."
+sudo -u ubuntu cat <<EOF > .env
+AWS_REGION=${aws_region}
+S3_BUCKET=${s3_bucket}
+DATABASE_URL=postgresql://${db_user}:${db_password}@${db_endpoint}:5432/postgres
+EOF
 
-    systemctl daemon-reload
-    systemctl enable fastapi.service
-    systemctl start fastapi.service
+# Create systemd service
+echo "Creating systemd service..."
+cat <<EOF >/etc/systemd/system/fastapi.service
+[Unit]
+Description=FastAPI Service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/specs-pipeline/backend
+ExecStart=/home/ubuntu/specs-pipeline/backend/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+EnvironmentFile=/home/ubuntu/specs-pipeline/backend/.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start service
+echo "Starting FastAPI service..."
+systemctl daemon-reload
+systemctl enable fastapi.service
+systemctl start fastapi.service
+
+echo "=== User-data script completed ==="
+systemctl status fastapi.service
