@@ -13,6 +13,7 @@ variable "environment" {
 variable "key_name" {
   description = "EC2 Key pair name (must exist in AWS)"
   type        = string
+  default     = "hitachi-spec-pipeline-key-pair"
 }
 
 variable "instance_type" {

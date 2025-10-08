@@ -1,7 +1,11 @@
-# random suffix for global resources
+########################
+# Random suffix for global resources
+########################
 resource "random_string" "suffix" {
   length  = 4
   lower   = true
+  upper   = false
+  numeric = true
   special = false
 }
 
@@ -12,7 +16,7 @@ resource "aws_vpc" "main" {
   cidr_block           = "10.10.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
-  tags = merge(local.tags, { Name = "${local.name_prefix}-vpc" })
+  tags                 = merge(local.tags, { Name = "${local.name_prefix}-vpc" })
 }
 
 resource "aws_subnet" "public_a" {
@@ -20,7 +24,15 @@ resource "aws_subnet" "public_a" {
   cidr_block              = "10.10.1.0/24"
   availability_zone       = "us-east-1a"
   map_public_ip_on_launch = true
-  tags = merge(local.tags, { Name = "${local.name_prefix}-subnet-a" })
+  tags                    = merge(local.tags, { Name = "${local.name_prefix}-subnet-a" })
+}
+
+resource "aws_subnet" "public_b" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.10.2.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+  tags                    = merge(local.tags, { Name = "${local.name_prefix}-subnet-b" })
 }
 
 resource "aws_internet_gateway" "igw" {
@@ -44,52 +56,33 @@ resource "aws_route_table_association" "public_assoc_a" {
   route_table_id = aws_route_table.public.id
 }
 
+resource "aws_route_table_association" "public_assoc_b" {
+  subnet_id      = aws_subnet.public_b.id
+  route_table_id = aws_route_table.public.id
+}
+
 ########################
 # Security Groups
 ########################
 resource "aws_security_group" "ec2_sg" {
-  name   = "${local.name_prefix}-ec2-sg"
-  vpc_id = aws_vpc.main.id
-  description = "Allow HTTP and SSH from allowed CIDR"
+  name        = "specs-pipeline-dev-dev-ec2-sg"
+  description = "Security group for EC2 instances"
+  vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_cidr]
-  }
-
-  ingress {
-    description = "SSH"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.allowed_cidr]
-  }
-
-  egress {
-    description = "all outbound"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
   }
-
-  tags = local.tags
-}
-
-resource "aws_security_group" "rds_sg" {
-  name   = "${local.name_prefix}-rds-sg"
-  vpc_id = aws_vpc.main.id
-  description = "Allow Postgres from EC2 SG"
 
   ingress {
-    description = "Postgres from EC2 SG"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ec2_sg.id]
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP access"
   }
 
   egress {
@@ -97,22 +90,62 @@ resource "aws_security_group" "rds_sg" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound"
   }
 
-  tags = local.tags
+  tags = {
+    Environment = "dev"
+    ManagedBy   = "terraform"
+    Project     = "specs-pipeline-dev"
+  }
+}
+
+# RDS SG – Do NOT modify ingress inside Terraform
+resource "aws_security_group" "rds_sg" {
+  name        = "specs-pipeline-dev-dev-rds-sg"
+  description = "Security group for RDS Postgres"
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "All outbound"
+  }
+
+  tags = {
+    Environment = "dev"
+    ManagedBy   = "terraform"
+    Project     = "specs-pipeline-dev"
+  }
+
+  lifecycle {
+    ignore_changes = [
+    ]
+  }
+}
+
+# Add ingress rule for EC2 → RDS
+resource "aws_security_group_rule" "rds_allow_ec2" {
+  type                     = "ingress"
+  from_port                = 5432
+  to_port                  = 5432
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.rds_sg.id
+  source_security_group_id = aws_security_group.ec2_sg.id
+  description              = "Allow EC2 SG to connect to RDS"
 }
 
 ########################
-# S3 bucket (uploads + outputs)
+# S3 Bucket (uploads + outputs)
 ########################
 resource "aws_s3_bucket" "docs_bucket" {
-  bucket = "${var.project_name}-docs-${random_string.suffix.result}"
+  bucket        = "${lower(var.project_name)}-docs-${random_string.suffix.result}"
   force_destroy = true
-
-  tags = merge(local.tags, { Name = "${local.name_prefix}-s3" })
+  tags          = merge(local.tags, { Name = "${local.name_prefix}-s3" })
 }
 
-# S3 bucket ownership controls
 resource "aws_s3_bucket_ownership_controls" "docs_bucket" {
   bucket = aws_s3_bucket.docs_bucket.id
   rule {
@@ -120,14 +153,12 @@ resource "aws_s3_bucket_ownership_controls" "docs_bucket" {
   }
 }
 
-# S3 bucket ACL
 resource "aws_s3_bucket_acl" "docs_bucket" {
   depends_on = [aws_s3_bucket_ownership_controls.docs_bucket]
   bucket     = aws_s3_bucket.docs_bucket.id
   acl        = "private"
 }
 
-# S3 bucket versioning
 resource "aws_s3_bucket_versioning" "docs_bucket" {
   bucket = aws_s3_bucket.docs_bucket.id
   versioning_configuration {
@@ -135,7 +166,6 @@ resource "aws_s3_bucket_versioning" "docs_bucket" {
   }
 }
 
-# S3 bucket server-side encryption
 resource "aws_s3_bucket_server_side_encryption_configuration" "docs_bucket" {
   bucket = aws_s3_bucket.docs_bucket.id
 
@@ -147,14 +177,13 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "docs_bucket" {
   }
 }
 
-# S3 bucket lifecycle configuration for cost optimization
 resource "aws_s3_bucket_lifecycle_configuration" "docs_bucket" {
   bucket = aws_s3_bucket.docs_bucket.id
 
   rule {
     id     = "delete_old_versions"
     status = "Enabled"
-
+    filter {}
     noncurrent_version_expiration {
       noncurrent_days = 30
     }
@@ -163,7 +192,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "docs_bucket" {
   rule {
     id     = "transition_to_ia"
     status = "Enabled"
-
+    filter {}
     transition {
       days          = 30
       storage_class = "STANDARD_IA"
@@ -171,7 +200,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "docs_bucket" {
   }
 }
 
-# S3 bucket public access block - allow presigned URLs, keep bucket private
 resource "aws_s3_bucket_public_access_block" "block" {
   bucket = aws_s3_bucket.docs_bucket.id
 
@@ -182,7 +210,7 @@ resource "aws_s3_bucket_public_access_block" "block" {
 }
 
 ########################
-# IAM role for EC2 to access S3
+# IAM Role for EC2 to Access S3
 ########################
 data "aws_iam_policy_document" "ec2_assume_role" {
   statement {
@@ -253,23 +281,23 @@ resource "aws_iam_instance_profile" "ec2_profile" {
 ########################
 resource "aws_db_subnet_group" "db_subnet" {
   name       = "${local.name_prefix}-db-subnet"
-  subnet_ids = [aws_subnet.public_a.id]
+  subnet_ids = [aws_subnet.public_a.id, aws_subnet.public_b.id]
   tags       = local.tags
 }
 
 resource "aws_db_instance" "postgres" {
-  identifier        = "${local.name_prefix}-postgres"
-  engine            = "postgres"
-  engine_version    = "15.4"
-  instance_class    = "db.t3.micro"
-  username          = var.db_username
-  password          = var.db_password
-  allocated_storage = 20
-  skip_final_snapshot = true
-  publicly_accessible = true
+  identifier             = "${local.name_prefix}-postgres"
+  engine                 = "postgres"
+  engine_version         = "17.6"
+  instance_class         = "db.t3.micro"
+  username               = var.db_username
+  password               = var.db_password
+  allocated_storage      = 20
+  skip_final_snapshot    = true
+  publicly_accessible    = true
   vpc_security_group_ids = [aws_security_group.rds_sg.id]
   db_subnet_group_name   = aws_db_subnet_group.db_subnet.name
-  tags = merge(local.tags, { Name = "${local.name_prefix}-rds" })
+  tags                   = merge(local.tags, { Name = "${local.name_prefix}-rds" })
 }
 
 ########################

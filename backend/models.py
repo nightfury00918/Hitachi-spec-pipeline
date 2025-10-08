@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import Column, Integer, String, DateTime, JSON, func
+from sqlalchemy import Column, Integer, String, DateTime, JSON, func, Text
 from db import Base
 
 
@@ -11,14 +11,14 @@ class MasterSpec(Base):
     """
     __tablename__ = "master_specs"
     id = Column(Integer, primary_key=True, index=True)
-    param = Column(String, nullable=False, index=True)   # not unique: multiple rows per param allowed
-    value = Column(String)         # canonical numeric/text value (string)
-    unit = Column(String)          # unit (mm, µm, bar, °C)
-    raw = Column(String)           # raw text we parsed
-    source = Column(String)        # which source chosen: DOCX/PDF/Image/MANUAL
-    origin = Column(String)        # original filename or identifier
+    param = Column(String(255), nullable=False, index=True)   # not unique: multiple rows per param allowed
+    value = Column(String(255))         # canonical numeric/text value (string)
+    unit = Column(String(50))          # unit (mm, µm, bar, °C)
+    raw = Column(Text)           # raw text we parsed - using Text for longer content
+    source = Column(String(100))        # which source chosen: DOCX/PDF/Image/MANUAL
+    origin = Column(String(255))        # original filename or identifier
     priority = Column(Integer, default=0)  # higher = more trusted / newer
-    uploaded_at = Column(DateTime, server_default=func.now())
+    uploaded_at = Column(DateTime(timezone=True), server_default=func.now())
     added_at = Column(DateTime(timezone=True), server_default=func.now())
     meta = Column(JSON, nullable=True)     # optional: extra metadata
 
@@ -26,8 +26,8 @@ class MasterSpec(Base):
 class RawExtraction(Base):
     __tablename__ = "raw_extractions"
     id = Column(Integer, primary_key=True, index=True)
-    source = Column(String)
-    origin = Column(String)
-    raw_text = Column(String)
+    source = Column(String(255))
+    origin = Column(String(255))
+    raw_text = Column(Text)  # Using Text for potentially long content
     meta_info = Column(JSON)
-    created_at = Column(DateTime, server_default=func.now())
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
