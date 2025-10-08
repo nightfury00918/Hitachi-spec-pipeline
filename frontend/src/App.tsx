@@ -24,7 +24,6 @@ function App() {
       setSpecs(data || []);
     } catch (err) {
       console.error("Fetch failed", err);
-      alert("Failed to load specs: " + (err as Error).message);
     } finally {
       setLoading(false);
     }
