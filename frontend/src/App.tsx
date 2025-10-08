@@ -39,7 +39,7 @@ function App() {
     }
   };
 
-  const isEmptyObject = (obj) => {
+  const isEmptyObject = (obj: any) => {
     // First, ensure the input is a non-null object
     if (obj === null || typeof obj !== "object") {
       return false; // Or throw an error, depending on desired behavior

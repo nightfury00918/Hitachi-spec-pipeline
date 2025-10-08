@@ -1,5 +1,5 @@
 // src/components/SpecsTable.tsx
-import React, { useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { saveSpecs } from "../services/api";
 
 type Variant = {
